@@ -1,7 +1,5 @@
 #pragma once
 
-enum class Processor : uint8_t { Default = 0, Fallback = 1 };
-
 void json_dump(const std::string &name, const Json::Value &jsonBody) {
 #ifdef JSON_DUMP
     Json::StyledWriter styledWriter;

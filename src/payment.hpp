@@ -5,6 +5,11 @@
 #include <iostream>
 #include <math.h>
 #include <string>
+#include <tuple>
+#include <queue>
+#include <vector>
+
+#include "global.hpp"
 
 class Summary {
 public:
@@ -53,15 +58,39 @@ private:
 
 class Payment {
 public:
-    Payment(std::string _correlationId, double _amount, const drogon::HttpClientPtr client, 
-        uint8_t processor, Summary *summary)
-        :correlationId(_correlationId), amount(_amount), client(client), 
-        summary(summary), processor(processor) {
+    Payment(std::string _correlationId, double _amount, Summary *summary, HealthCheck *hc)
+        :correlationId(_correlationId), amount(_amount), summary(summary), hc(hc) {
         requestedAt = std::chrono::floor<std::chrono::milliseconds>(std::chrono::system_clock::now());
     }
-    ~Payment() {}
 
-    void process(std::function<void(const drogon::HttpResponsePtr &)> callback) {
+    static std::tuple<int,int> getStats() {
+        std::unique_lock<std::mutex> lk(pq_mtx);
+        size_t q_len = p_queue.size();
+        auto stats = std::make_tuple(q_len, inFlight.load());
+        return stats;
+    }
+
+    static void enqueue(Payment order) {
+        std::unique_lock<std::mutex> lk(pq_mtx);
+        p_queue.push(std::move(order));
+        lk.unlock();
+        Payment::drainQueue();
+    }
+
+    static void drainQueue() {
+        for (;;) {
+            std::unique_lock<std::mutex> lk(pq_mtx);
+            if (p_queue.empty() || inFlight.load() >= MAX_IN_FLIGHT) return;
+            if (!p_queue.front().hc->hasAvailable()) return;
+            Payment payorder = std::move(p_queue.front());
+            p_queue.pop();
+            lk.unlock();
+            inFlight++;
+            payorder.process();
+        }
+    }
+
+    void process() {
         Json::Value json;
         json["correlationId"] = correlationId;
         json["amount"] = amount;
@@ -69,51 +98,64 @@ public:
         
         auto t0 = std::chrono::system_clock::now();
         auto req = drogon::HttpRequest::newHttpJsonRequest(json);
-        
-        int64_t requestedAtMs = requestedAt.time_since_epoch().count();
-        int64_t amountCents = std::llround(amount * 100.0);
-        uint8_t proc = processor;
-        Summary *sum = summary; 
-
         req->setMethod(drogon::Post);
         req->setPath("/payments");
-        client->sendRequest(req, [requestedAtMs, amountCents, proc, sum, 
-            cb = std::move(callback), corr = correlationId, t0,
-            processor = processor, this]
-            (drogon::ReqResult result, const drogon::HttpResponsePtr &resp) {
-            auto out = drogon::HttpResponse::newHttpResponse();
-            int status = resp ? static_cast<int>(resp->statusCode()) : -1;
-            auto t1 = std::chrono::system_clock::now();
-            if (result == drogon::ReqResult::Ok && status == 200) {
+        
+        try {
+            auto [client, processor] = hc->getAvailableState();
+            int64_t requestedAtMs = requestedAt.time_since_epoch().count();
+            int64_t amountCents = std::llround(amount * 100.0);
+            uint8_t procByte = static_cast<uint8_t>(processor);
+            Summary *sum = summary;
+#ifdef DEBUG_PAYMENT
+            std::cout << "processing correlationId=" << correlationId << std::endl;
+#endif            
+            client->sendRequest(req, [t0, sum, requestedAtMs, amountCents, procByte, self = *this]
+                (drogon::ReqResult result, const drogon::HttpResponsePtr &resp) {
+                int status = resp ? static_cast<int>(resp->statusCode()) : -1;
+                auto t1 = std::chrono::system_clock::now();
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-                sum->add({requestedAtMs, amountCents, proc});
-                out->setStatusCode(drogon::k201Created);
-                std::cout << " processing done at " << static_cast<int>(processor) << " for payment correlationId " << corr << " with " << ms << std::endl;
-            } else {
-                std::cout << "processor " << static_cast<int>(processor) << " rejected corr=" << corr
-                            << " result=" << static_cast<int>(result)
-                            << " status=" << status
-                            << " body="  << (resp ? std::string(resp->getBody()) : "<null>")
-                            << std::endl;
-                handleResponse(status);
-                out->setStatusCode(drogon::k502BadGateway);
-            }
-            cb(out);
-        });
-    }
-
-    void handleResponse(int httpStatus) {
-        if (httpStatus != 500)
-            return;
-
-        // TODO, need to wait until its back
+                if (result == drogon::ReqResult::Ok && 
+                    status == 200) {
+                    sum->add({requestedAtMs, amountCents, static_cast<uint8_t>(procByte)});
+#ifdef DEBUG_PAYMENT
+                    std::cout << " processing done endpoint=" << static_cast<int>(procByte)
+                                << " correlationId " << self.correlationId
+                                << " with " << ms
+                                << std::endl;
+#endif
+                    inFlight--;
+                    Payment::drainQueue();
+                } else {
+#ifdef DEBUG_PAYMENT
+                    std::cout << "processor " << static_cast<int>(procByte) << " rejected corr=" << self.correlationId
+                                << " result=" << static_cast<int>(result)
+                                << " status=" << status
+                                << " body="  << (resp ? std::string(resp->getBody()) : "<null>")
+                                << " with=" << ms
+                                << std::endl;
+#endif
+                    inFlight--;
+                    Payment::enqueue(std::move(self));
+                }
+            });
+        } catch(const std::invalid_argument& e) {
+#ifdef DEBUG_PAYMENT
+            std::cout << "unavailable endpoint during correlationId=" << correlationId << " " << *hc << std::endl;
+#endif
+            inFlight--;
+            std::lock_guard<std::mutex> lk(pq_mtx);
+            p_queue.push(std::move(*this));
+        }
     }
 
 private:
     std::string correlationId;
     double amount;
-    uint8_t processor;
     std::chrono::sys_time<std::chrono::milliseconds> requestedAt;
-    const drogon::HttpClientPtr client;
     Summary *summary;
+    HealthCheck *hc;
+    inline static std::queue<Payment> p_queue;
+    inline static std::mutex pq_mtx;
+    inline static std::atomic<int> inFlight{0};
 };

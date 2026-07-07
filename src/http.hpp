@@ -5,16 +5,14 @@
 #include "payment.hpp"
 #include "utils.hpp"
 
-#define THREAD_N    4
-#define DROGON_PORT 8080
-#define DROGON_IP   "0.0.0.0"
+#include "global.hpp"
 
 int https_start() {
     std::cout << "registering http server at " << DROGON_PORT << "..." << std::endl;
     drogon::app()
         .setLogLevel(trantor::Logger::kError)
         .addListener(DROGON_IP, DROGON_PORT)
-        .setThreadNum(0/*THREAD_N*/);
+        .setThreadNum(THREAD_N);
 
     HealthCheck hc;
     hc.startTimer();
@@ -49,30 +47,29 @@ int https_start() {
             auxClient->sendRequest(extraReq, [extraReq, aggi, cb = std::move(callback), t0]
                 (drogon::ReqResult result, const drogon::HttpResponsePtr &resp) {
                 int status = resp ? static_cast<int>(resp->statusCode()) : -1;
-                auto agg2 = resp->getJsonObject();
-                std::cout << " get partial result " << result << " status " << status << std::endl;
+                std::cout << " get partial result=" << result << " status=" << status
+                    << " resp=" << (resp ? "valid" : "null") << std::endl;
                 Json::Value paySummary = {};
-                if (result == drogon::ReqResult::Ok) {
-                    Summary::Totals m = aggi;
-                    m.defaultCount += (*agg2)["default"]["totalRequests"].asInt64();
-                    m.defaultCents += (*agg2)["default"]["totalAmount"].asInt64();
-                    m.fallbackCount += (*agg2)["fallback"]["totalRequests"].asInt64();
-                    m.fallbackCents += (*agg2)["fallback"]["totalAmount"].asInt64();
-
-                    paySummary["default"]["totalRequests"] = m.defaultCount;
-                    paySummary["default"]["totalAmount"] = m.defaultCents/100.0;
-                    paySummary["fallback"]["totalRequests"] = m.fallbackCount;
-                    paySummary["fallback"]["totalAmount"] = m.fallbackCents/100.0;
-                    json_dump("aggregate", paySummary);
-                } else {
-                }
-                
+                Summary::Totals m = aggi;
+                if (result == drogon::ReqResult::Ok && resp) {
+                    if (auto agg2 = resp->getJsonObject()) {
+                        m.defaultCount += (*agg2)["default"]["totalRequests"].asInt64();
+                        m.defaultCents += (*agg2)["default"]["totalAmount"].asInt64();
+                        m.fallbackCount += (*agg2)["fallback"]["totalRequests"].asInt64();
+                        m.fallbackCents += (*agg2)["fallback"]["totalAmount"].asInt64();
+                    }
+                } 
+                paySummary["default"]["totalAmount"] = m.defaultCents/100.0;
+                paySummary["default"]["totalRequests"] = m.defaultCount;
+                paySummary["fallback"]["totalRequests"] = m.fallbackCount;
+                paySummary["fallback"]["totalAmount"] = m.fallbackCents/100.0;
+                json_dump("aggregate", paySummary);
                 auto t1 = std::chrono::system_clock::now();
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
                 std::cout << " get summary done with " << ms << std::endl;
                 auto res = drogon::HttpResponse::newHttpJsonResponse(paySummary);
                 cb(res);
-            });
+            }, PAYMENT_SUM_TIMEOUT);
         },
         {drogon::Get});
 
@@ -107,24 +104,38 @@ int https_start() {
             std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
 
             auto body = req->getJsonObject();
+            auto resp = drogon::HttpResponse::newHttpResponse();
             if (!body) {
-                auto resp = drogon::HttpResponse::newHttpResponse();
                 resp->setStatusCode(drogon::k400BadRequest);
                 callback(resp);
                 return;
             }
 
-            try {
-                auto [client, proc] = hc.getAvailableState();
-                Payment order((*body)["correlationId"].asString(),
-                              (*body)["amount"].asDouble(),
-                              client, static_cast<uint8_t>(proc), &summary);
-                order.process(callback);
-            } catch (const std::invalid_argument& e) {
-                std::cout << "....not available endpoints..." << std::endl;
-            }
+            Payment order((*body)["correlationId"].asString(),
+                    (*body)["amount"].asDouble(), &summary, &hc);
+            Payment::enqueue(std::move(order));
+
+            resp->setStatusCode(drogon::k202Accepted);
+            callback(resp);
         },
         {drogon::Post});
+
+    drogon::app().registerHandler(
+        "/get-internal-stats",
+        [](const drogon::HttpRequestPtr &req,
+            std::function<void(const drogon::HttpResponsePtr &)> &&callback) {
+            Json::Value result;
+            auto [len, flight] = Payment::getStats();
+            result["queue_size"] = len;
+            result["load"] = flight;
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(result);
+            callback(resp);
+        },
+        {drogon::Get});
+
+    drogon::app().getLoop()->runEvery(PAYMENT_DRAIN_RATE, []() {
+        Payment::drainQueue();
+    });
 
     std::cout << "http server started" << std::endl;
     drogon::app().run();

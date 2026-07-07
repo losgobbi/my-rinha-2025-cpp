@@ -1,11 +1,11 @@
 #pragma once
 #include <drogon/drogon.h>
+#include <ostream>
 #include <iostream>
 #include <unordered_map>
 
 #include "utils.hpp"
-
-#define DEFAULT_HC_WINDOW   5.0
+#include "global.hpp"
 
 class HealthCheck {
 public:
@@ -14,8 +14,11 @@ public:
         int minResponseTime = 0;
         drogon::ReqResult res;
 
-        std::string toString() const {
-          return "failing=" + std::to_string(failing) + " minResponseTime=" + std::to_string(minResponseTime) + " res=" + std::to_string(static_cast<int>(res));
+        friend std::ostream& operator<<(std::ostream& os, const State& st) {
+            os << "failing=" << st.failing
+                << " minResponseTime=" << std::to_string(st.minResponseTime) 
+                << " res=" + std::to_string(static_cast<int>(st.res));
+            return os;
         }
     };
 
@@ -24,6 +27,7 @@ public:
             std::getenv("PROCESSOR_DEFAULT_URL") ?: "http://payment-processor-default:8080");
         fallbackClient = drogon::HttpClient::newHttpClient(
             std::getenv("PROCESSOR_FALLBACK_URL") ?: "http://payment-processor-fallback:8080");
+        buildPools();
     }
 
     ~HealthCheck() {}
@@ -31,22 +35,34 @@ public:
     void check(const drogon::HttpClientPtr &client, const std::string &name, State &state) {
         auto req = drogon::HttpRequest::newHttpRequest();
         req->setPath("/payments/service-health");
-        client->sendRequest(req, [&](drogon::ReqResult result, const drogon::HttpResponsePtr &resp) {
+        client->sendRequest(req, [name, &state, this](drogon::ReqResult result, const drogon::HttpResponsePtr &resp) {
+            int status = resp ? static_cast<int>(resp->statusCode()) : -1;
+#ifdef DEBUG_HC
+            std::cout << "hc status=" << status
+                    << " result=" << static_cast<int>(result)
+                    << " body=" << (resp ? std::string(resp->getBody()) : "<null>")
+                    << std::endl;
+#endif
+            state.res = result;
             if (result == drogon::ReqResult::Ok) {
-                auto body = resp->getJsonObject();
-                if (body) {
-                    json_dump("service-health", *body);
-                    state.failing = (*body)["failing"].asBool();
-                    state.minResponseTime = (*body)["minResponseTime"].asInt();
-                    state.res = result;
+                if (auto body = resp->getJsonObject()) {
+                   state.failing = (*body)["failing"].asBool();
+                   state.minResponseTime = (*body)["minResponseTime"].asInt();
                 }
-            } else {
-                std::cout << name << " health check failed with " << result << std::endl;
-                state.res = result;
-            }
+            } 
+#ifdef DEBUG_HC
+            std::cout << *this << std::endl;
+#endif
         });
-        if (state.failing)
-            std::cout << state.toString() << std::endl;
+    }
+
+    void buildPools() { 
+        size_t n = drogon::app().getThreadNum(); 
+        for (int i = 0; i < POOL_SIZE; ++i) {
+            trantor::EventLoop* lp = drogon::app().getIOLoop(i % n);
+            defaultClients.push_back(drogon::HttpClient::newHttpClient(std::getenv("PROCESSOR_DEFAULT_URL"), lp));
+            fallbackClients.push_back(drogon::HttpClient::newHttpClient(std::getenv("PROCESSOR_FALLBACK_URL"), lp));
+        }
     }
 
     void startTimer() {
@@ -56,21 +72,41 @@ public:
         });
     }
 
-    // TODO, might check the lowest minResponseTime
-    std::pair<drogon::HttpClientPtr, Processor> getAvailableState() {
-        if (!defaultState.failing)
-            return { defaultClient, Processor::Default };
-        
-        if (!fallbackState.failing)
-            return { fallbackClient, Processor::Fallback };
-
-
-        throw std::invalid_argument("no available endpoint");
+    bool hasAvailable() const {
+        return !defaultState.failing || !fallbackState.failing;
     }
 
-    void dumpHc() {
-        std::cout << "default: " << defaultState.toString() << std::endl;
-        std::cout << "fallback: " << fallbackState.toString() << std::endl;
+    std::pair<drogon::HttpClientPtr, Processor> getAvailableState() {
+        static std::atomic<size_t> rr{0};
+        size_t i = rr++;
+
+        if (defaultState.failing && fallbackState.failing)
+            throw std::invalid_argument("no available endpoint");
+
+        if (!defaultState.failing && fallbackState.failing) 
+            return { defaultClients[i % defaultClients.size()], Processor::Default };
+
+        if (!fallbackState.failing && defaultState.failing)
+            return { fallbackClients[i % fallbackClients.size()], Processor::Fallback };
+
+        if (fallbackState.minResponseTime < defaultState.minResponseTime)
+            return { fallbackClients[i % fallbackClients.size()], Processor::Fallback };
+
+        return { defaultClients[i % defaultClients.size()], Processor::Default };
+
+#ifdef OLD
+        if (!defaultState.failing)
+            return { defaultClients[i % defaultClients.size()], Processor::Default };
+        if (!fallbackState.failing)
+            return { fallbackClients[i % fallbackClients.size()], Processor::Fallback };
+
+        throw std::invalid_argument("no available endpoint");
+#endif
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const HealthCheck& hc) {
+        os << "default " << hc.defaultState << " fallback " << hc.fallbackState;
+        return os;
     }
 
 private:
@@ -78,4 +114,6 @@ private:
     State fallbackState;
     drogon::HttpClientPtr defaultClient;
     drogon::HttpClientPtr fallbackClient;
+    std::vector<drogon::HttpClientPtr> defaultClients;
+    std::vector<drogon::HttpClientPtr> fallbackClients;
 };
